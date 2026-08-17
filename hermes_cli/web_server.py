@@ -15122,8 +15122,12 @@ def _ws_auth_mode() -> str:
     return "loopback"
 
 
-def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
-    """Validate WS-upgrade auth; return ``(reason, credential)``.
+def _ws_auth_with_info(ws: "WebSocket") -> tuple[Optional[str], str, Optional[dict]]:
+    """Validate WS-upgrade auth; return ``(reason, credential, auth_info)``.
+
+    ``auth_info`` is the identity dict (``{user_id, provider, ...}``) returned
+    by ``consume_ticket`` / ``consume_internal_credential`` when the credential
+    is a dashboard ticket or server-internal credential, else ``None``.
 
     ``reason`` is None when the credential is accepted, else a short
     machine-parseable token explaining the rejection (``no_credential``,
@@ -15171,8 +15175,8 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         internal = ws.query_params.get("internal", "")
         if internal:
             try:
-                consume_internal_credential(internal)
-                return None, "internal"
+                info = consume_internal_credential(internal)
+                return None, "internal", info
             except TicketInvalid as exc:
                 audit_log(
                     AuditEvent.WS_TICKET_REJECTED,
@@ -15180,15 +15184,15 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                     ip=(ws.client.host if ws.client else ""),
                     path=ws.url.path,
                 )
-                return "internal_invalid", "internal"
+                return "internal_invalid", "internal", None
 
         ticket = ws.query_params.get("ticket", "")
         if not ticket:
-            return "no_credential", "none"
+            return "no_credential", "none", None
 
         try:
-            consume_ticket(ticket)
-            return None, "ticket"
+            info = consume_ticket(ticket)
+            return None, "ticket", info
         except TicketInvalid as exc:
             audit_log(
                 AuditEvent.WS_TICKET_REJECTED,
@@ -15196,14 +15200,24 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                 ip=(ws.client.host if ws.client else ""),
                 path=ws.url.path,
             )
-            return "ticket_invalid", "ticket"
+            return "ticket_invalid", "ticket", None
 
     token = ws.query_params.get("token", "")
     if not token:
-        return "no_credential", "none"
+        return "no_credential", "none", None
     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
-        return None, "token"
-    return "token_mismatch", "token"
+        return None, "token", None
+    return "token_mismatch", "token", None
+
+
+def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
+    """Validate WS-upgrade auth; return ``(reason, credential)``.
+
+    Boolean-outcome form of :func:`_ws_auth_with_info` — discards the
+    authenticated identity info. See there for the full contract.
+    """
+    reason, credential, _info = _ws_auth_with_info(ws)
+    return reason, credential
 
 
 def _ws_auth_ok(ws: "WebSocket") -> bool:
@@ -16298,7 +16312,8 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if not _ws_auth_ok(ws):
+    auth_reason, _credential, auth_info = _ws_auth_with_info(ws)
+    if auth_reason is not None:
         await ws.close(code=4401)
         return
 
@@ -16308,7 +16323,7 @@ async def gateway_ws(ws: WebSocket) -> None:
 
     from tui_gateway.ws import handle_ws
 
-    await handle_ws(ws)
+    await handle_ws(ws, principal_info=auth_info)
 
 
 # ---------------------------------------------------------------------------

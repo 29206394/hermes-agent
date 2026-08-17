@@ -283,7 +283,25 @@ def _disable_nagle(ws: Any) -> None:
         _log.debug("ws TCP_NODELAY skip: %s", exc)
 
 
-async def handle_ws(ws: Any) -> None:
+def _bind_connection_identity(request: dict, info: dict | None) -> dict:
+    """Copy the server-verified identity over client-supplied RPC fields."""
+    if not info:
+        return request
+    params = dict(request.get("params") or {})
+    if info.get("user_id") == "server-internal":
+        params.pop("pty_user_id", None)
+        params.pop("pty_provider", None)
+    else:
+        params.update(
+            pty_user_id=str(info["user_id"]),
+            pty_provider=str(info.get("provider") or ""),
+        )
+    bound = dict(request)
+    bound["params"] = params
+    return bound
+
+
+async def handle_ws(ws: Any, principal_info: dict | None = None) -> None:
     """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``."""
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
@@ -388,6 +406,8 @@ async def handle_ws(ws: Any) -> None:
             # response dict, which we write here from the loop.
             req_id = req.get("id") if isinstance(req, dict) else None
             req_method = req.get("method") if isinstance(req, dict) else None
+            if isinstance(req, dict):
+                req = _bind_connection_identity(req, principal_info)
             try:
                 resp = await asyncio.to_thread(server.dispatch, req, transport)
             except Exception:
