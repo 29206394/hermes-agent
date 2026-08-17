@@ -42,6 +42,13 @@ def _(rid, params: dict) -> dict:
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
 
+    # Server-verified connection identity, bound by
+    # tui_gateway.ws._bind_connection_identity from the dashboard WS-ticket auth.
+    # Retained on the live session record so plugins (e.g. session-title-owner)
+    # can attribute a session to its authenticated operator.
+    pty_user_id = str(params.get("pty_user_id") or "").strip() or None
+    pty_provider = str(params.get("pty_provider") or "").strip() or None
+
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
     # the agent below) — never a global config write, so picking a model/effort
@@ -99,6 +106,8 @@ def _(rid, params: dict) -> dict:
             "parent_session_id": parent_session_id,
             "pending_title": title or None,
             "profile_home": str(profile_home) if profile_home is not None else None,
+            "pty_user_id": pty_user_id,
+            "pty_provider": pty_provider,
             "running": False,
             "session_key": key,
             "show_reasoning": _load_show_reasoning(),

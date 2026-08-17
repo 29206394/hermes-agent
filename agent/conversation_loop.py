@@ -713,19 +713,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # prompt) — build from scratch.
     agent._cached_system_prompt = agent._build_system_prompt(system_message)
 
-    # Plugin hook: on_session_start — fired once when a brand-new
-    # session is created (not on continuation).  Plugins can use this
-    # to initialise session-scoped state (e.g. warm a memory cache).
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_start",
-            session_id=agent.session_id,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_start hook failed: %s", exc)
+    # NOTE (Issue #149): the on_session_start plugin hook was historically
+    # fired here, but the whole function is gated by
+    # ``agent._cached_system_prompt is None`` in build_turn_context, and the
+    # tui_gateway desktop path pre-warms that attribute at agent build — so
+    # desktop sessions silently skipped the hook. The trigger now lives in
+    # build_turn_context (first-turn condition + _session_start_fired guard),
+    # which every run_conversation path passes through. Keep this block
+    # hook-free so the hook fires exactly once regardless of cache state.
 
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in
