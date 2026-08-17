@@ -1149,6 +1149,27 @@ def build_turn_context(
         )
         agent._persist_user_message_idx = current_turn_user_idx
 
+    # Plugin hook: on_session_start — fired exactly once when a brand-new
+    # session produces its first turn, independent of system-prompt caching.
+    # (Issue #149: tui_gateway pre-warms _cached_system_prompt at agent build,
+    # so the legacy trigger inside restore_or_build_system_prompt was skipped
+    # on the desktop path. The first-turn condition here mirrors the
+    # pre_llm_call is_first_turn convention; _session_start_fired guards
+    # against duplicate firing when the restore path also builds fresh.)
+    try:
+        if (not bool(conversation_history)) and not getattr(agent, "_session_start_fired", False):
+            agent._session_start_fired = True
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+
+            _invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+    except Exception:
+        logger.warning("on_session_start hook failed", exc_info=True)
+
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
