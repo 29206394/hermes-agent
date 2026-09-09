@@ -141,6 +141,21 @@ class TestSidebarScope:
         assert _slice_ids(payload, "messaging") == {"default-telegram", "worker-telegram"}
         assert {row["profile"] for row in payload["messaging"]["sessions"]} == {"default", "worker"}
 
+    def test_recents_excludes_a2a_by_default(self, client, profiles_on_disk):
+        # a2a 是 agent 间 A2A 委派会话（非真人交互），后端兜底默认从 recents
+        # 排除，前端无需在 recents_exclude 显式传 a2a（#246）。cli 是本地真人
+        # 会话，应正常留在 recents。
+        _seed_session(profiles_on_disk["default"], "default-chat", source="cli")
+        _seed_session(profiles_on_disk["default"], "default-a2a", source="a2a")
+
+        payload = client.get(
+            "/api/profiles/sessions/sidebar",
+            params={"recents_profile": "all", "recents_exclude": "cron,telegram"},
+        ).json()
+
+        assert payload["errors"] == []
+        assert _slice_ids(payload, "recents") == {"default-chat"}
+
 
 class TestCrossProfileProjectTree:
 

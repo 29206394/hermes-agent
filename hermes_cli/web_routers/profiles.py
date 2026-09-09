@@ -482,6 +482,11 @@ def get_profiles_sessions_sidebar(
 
     recents_scope = (recents_profile or "all").strip() or "all"
     recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
+    # a2a 是 agent 间 A2A 委派会话（非真人交互），数量大且非用户主动发起，
+    # 会淹没「最近会话」窗口，故后端兜底从 recents 排除（#246）。与前端传入
+    # 的 recents_exclude 取并集，前端无需再传 a2a。
+    if "a2a" not in recents_exclude_list:
+        recents_exclude_list.append("a2a")
     messaging_exclude_list = [s for s in (messaging_exclude or "").split(",") if s.strip()]
     # (source, exclude) per slice; ``source=cron`` is the implicit cron taxonomy.
     slice_scope = {"recents": (None, recents_exclude_list), "cron": ("cron", None),
