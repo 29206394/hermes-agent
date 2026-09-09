@@ -50,6 +50,55 @@ _PASTE_PREVIEW_LABEL = "\n\nPasted content:\n"
 _ATTACHMENT_REF_RE = re.compile(r"@(?:file|folder):\S+")
 # Footers the @-reference expander appends below the typed text (agent/context_references.py).
 _CONTEXT_FOOTER_RE = re.compile(r"\n+--- (?:Context Warnings|Attached Context) ---\n.*", re.DOTALL)
+
+# ── 非真人会话标题前缀（本地 patch #245）────────────────────────────────────
+# 非真人来源的会话按 source 加前缀，与真人身份前缀（如 [莫闲]）正交。
+# 白名单 = 真人入口：dashboard（desktop）/ 飞书 / 本地终端与命令行（tui/cli/codex）。
+# 其余来源（a2a/cron/subagent/gateway/local/tool/kanban/unknown/messaging…）一律按非真人处理。
+_HUMAN_TITLE_SOURCES = frozenset({"desktop", "feishu", "tui", "cli", "codex"})
+_NON_HUMAN_TITLE_PREFIX = {
+    "a2a": "[A2A]",
+    "cron": "[定时]",
+    "subagent": "[子任务]",
+}
+_DEFAULT_NON_HUMAN_TITLE_PREFIX = "[自动]"
+# 上游 title_generator 自己会给某些来源加前缀（子任务为 "Subagent: "）——已带上游前缀的标题
+# 不再叠加本地来源前缀，否则会渲染成 "[子任务] Subagent: …"。
+_UPSTREAM_TITLE_PREFIXES = ("Subagent: ",)
+
+
+def decorate_title(title: Optional[str], session_source: Optional[str]) -> Optional[str]:
+    """非真人来源的会话标题按来源加前缀（幂等）。
+
+    ``title`` 为 None/空、``session_source`` 为空或真人来源时原样返回。
+    已带本来源前缀的标题不重复加，保证 LLM 覆盖 / 手动改名 / 回填多轮都安全。
+    """
+    text = (title or "").strip()
+    if not text:
+        return title
+    src = (session_source or "").strip()
+    if not src or src in _HUMAN_TITLE_SOURCES:
+        return title
+    prefix = _NON_HUMAN_TITLE_PREFIX.get(src, _DEFAULT_NON_HUMAN_TITLE_PREFIX)
+    if text.startswith(prefix):
+        return title
+    # 上游 apply_subagent_title 已给子任务标题加了 "Subagent: " 前缀（#97202）——不再叠加本地前缀。
+    if any(text.startswith(up) for up in _UPSTREAM_TITLE_PREFIXES):
+        return title
+    return f"{prefix} {text}"
+
+
+def _session_source(session_db, session_id: str) -> Optional[str]:
+    """读会话的 source 字段，供标题装饰用；失败静默返回 None（不阻塞标题落地）。"""
+    try:
+        row = session_db.get_session(session_id)
+        if isinstance(row, dict):
+            src = row.get("source")
+            return src if isinstance(src, str) and src.strip() else None
+    except Exception:
+        logger.debug("read session source for title decoration failed", exc_info=True)
+    return None
+
 # Cap on the instant derived title; a raw fragment reads worse the longer it runs.
 MAX_DERIVED_TITLE_CHARS = 48
 # Answer-shaped guard: a tiny model sometimes answers instead of titling; longer is rejected, not truncated.
@@ -512,6 +561,10 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
     ``ValueError`` means the name is taken by an unrelated session (the unique-title index); rather than
     leave the session untitled (#50537), append a ``#N`` suffix via ``get_next_title_in_lineage``.
     """
+    # 非真人来源按 source 加前缀（幂等）—— 见 decorate_title。失败静默：装饰
+    # 只影响展示，标题落地永远不该被前缀逻辑阻塞。
+    title = decorate_title(title, _session_source(session_db, session_id)) or title
+
     auto_fn = getattr(session_db, "set_auto_title", None)
 
     def _set(candidate):
