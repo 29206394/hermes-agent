@@ -494,6 +494,10 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "WHATSAPP_REQUIRE_MENTION",
     "DINGTALK_REQUIRE_MENTION",
     "MATRIX_REQUIRE_MENTION",
+    # Machine-only channel declaration (one-shot `-z`). A leaked value would make every later
+    # session minted in this process born hidden, and a test asserting an interactive row stays
+    # visible would then pass for the wrong reason.
+    "HERMES_HIDDEN_SESSION",
 })
 
 
@@ -658,6 +662,39 @@ def _reset_foreground_exit_fence():
     yield
     if (base := sys.modules.get("tools.environments.base")) is not None:
         base._exit_fenced = False
+
+
+@pytest.fixture(autouse=True)
+def _reset_session_context_singletons():
+    """Return every ``gateway.session_context`` binding to its never-bound default.
+
+    The module keeps a turn's identity in ContextVars so it travels with the task, and the
+    non-messaging ones are process-wide. Two leaks make the suite order-dependent:
+
+    * ``declare_stateless_channel()`` (run by every in-process one-shot turn) latches
+      ``_SESSION_ASYNC_DELIVERY`` to False and never restores it, so
+      ``tests/gateway/test_async_delivery_capability.py::TestAsyncDeliverySupported::
+      test_default_unbound_is_supported`` sees a stateless channel;
+    * ``clear_session_vars()`` sets the vars to ``""`` rather than unsetting them, and
+      ``get_session_env`` returns a var that was ever set — even to empty — in preference to
+      ``os.environ``, so ``tests/agent/test_declared_conversation_scope.py::
+      TestSourceOverrideDomain::test_the_pre_row_source_matches_persistence`` ignores its own
+      ``monkeypatch.setenv``.
+
+    Both pass in isolation and fail after the other file has run. Reset around every test so the
+    suite is order-independent.
+    """
+
+    def _reset() -> None:
+        try:
+            from gateway.session_context import reset_session_vars
+        except Exception:
+            return  # module shape changed — tests relying on this keep prior behavior
+        reset_session_vars()
+
+    _reset()
+    yield
+    _reset()
 
 
 @pytest.fixture(autouse=True)
