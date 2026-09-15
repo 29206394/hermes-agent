@@ -1200,6 +1200,39 @@ def _sdk_build(request_cls: Any, **fields: Any) -> Any:
     return builder.build()
 
 
+# Feishu topic ids are ``omt_…``. The ``thread_id`` slot is also fed ``root_id`` (an ``om_…``
+# message id) whenever an inbound event carries no topic, so an unvalidated value there is a
+# message id masquerading as a topic.
+_FEISHU_TOPIC_PREFIX = "omt_"
+_POLLUTED_THREAD_IDS_REPORTED: set = set()
+
+
+def _feishu_topic_id(value: Any) -> Optional[str]:
+    """``value`` when it is a real Feishu topic id, else ``None``.
+
+    Anything else (typically ``om_…``) must not be treated as a topic: the send-message API's
+    ``receive_id_type`` enum has no ``thread_id`` member, so forwarding a bogus one can only
+    produce ``99992402 field validation failed``.
+    """
+    if not value:
+        return None
+    text = str(value)
+    return text if text.startswith(_FEISHU_TOPIC_PREFIX) else None
+
+
+def _warn_thread_id_pollution(value: Any, chat_id: str) -> None:
+    """Log a non-topic ``thread_id`` once per distinct value (cron retries would otherwise flood)."""
+    key = str(value)
+    if key in _POLLUTED_THREAD_IDS_REPORTED:
+        return
+    _POLLUTED_THREAD_IDS_REPORTED.add(key)
+    logger.warning(
+        "[Feishu] Ignoring thread_id %r for chat %s: not a topic id (Feishu records a message id "
+        "here when the origin event carries no topic). Sending top-level to the chat.",
+        key, chat_id,
+    )
+
+
 class FeishuAdapter(BasePlatformAdapter):
     """Feishu/Lark bot adapter."""
     # Answers /p/<profile>/... on the default listener for a served secondary (shared_ingress).
@@ -3533,27 +3566,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 key_msg_type=resolved_message_type, key_payload=key_payload,
                 media_tag={"tag": "media", "file_key": file_key, "file_name": display_name},
             )
-            # Audio may fail with 99992402 under thread_id routing: retry as a reply to the
-            # thread's last message, then fall back to a plain chat_id send.
-            if (not caption
-                    and not self._response_succeeded(message_response)
-                    and getattr(message_response, "code", None) == 99992402
-                    and resolved_message_type == "audio"
-                    and (metadata or {}).get("thread_id")):
-                payload = json.dumps(key_payload, ensure_ascii=False)
-                thread_msg_id = (metadata or {}).get("reply_to_message_id")
-                if not thread_msg_id:
-                    thread_msg_id = await self._fetch_last_message_in_thread((metadata or {}).get("thread_id"))
-                if thread_msg_id:
-                    logger.info("[Feishu] Audio: retrying via reply API in thread")
-                    message_response = await self._feishu_send_with_retry(
-                        chat_id=chat_id, msg_type="audio", payload=payload, reply_to=thread_msg_id, metadata=metadata,
-                    )
-                if not self._response_succeeded(message_response):
-                    logger.warning("[Feishu] Audio send failed in thread, retrying with chat_id")
-                    message_response = await self._feishu_send_with_retry(
-                        chat_id=chat_id, msg_type="audio", payload=payload, reply_to=None, metadata=None,
-                    )
+            # Threaded sends used to fail here with 99992402 and were retried by hand (anchor →
+            # thread reply → chat_id). ``_send_raw_message`` now owns that routing for every
+            # message type, so there is nothing left to special-case for audio.
             return self._finalize_send_result(message_response, "file send failed")
         except Exception as exc:
             logger.error("[Feishu] Failed to send file %s: %s", file_path, exc, exc_info=True)
@@ -3593,8 +3608,14 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _send_raw_message(
         self, *, chat_id: str, msg_type: str, payload: str, reply_to: Optional[str], metadata: Optional[Dict[str, Any]],
     ) -> Any:
-        thread_id = (metadata or {}).get("thread_id")
-        effective_reply_to = reply_to or ((metadata or {}).get("reply_to_message_id") if thread_id else None)
+        # A topic is reachable only through the reply API: ``receive_id_type`` has no ``thread_id``
+        # member (chat_id/open_id/user_id/union_id/email), so passing one there is a guaranteed
+        # 99992402. Anchor on the caller's anchor, else the topic's last message, else post
+        # top-level into the chat. Cron turns have no inbound message to reply to, so they always
+        # arrive here without an anchor. See #375.
+        raw_thread_id = (metadata or {}).get("thread_id")
+        thread_id = _feishu_topic_id(raw_thread_id)
+        effective_reply_to = reply_to or (metadata or {}).get("reply_to_message_id")
         if effective_reply_to:
             body = self._build_reply_message_body(
                 content=payload, msg_type=msg_type, reply_in_thread=bool(thread_id), uuid_value=str(uuid.uuid4()),
@@ -3602,9 +3623,32 @@ class FeishuAdapter(BasePlatformAdapter):
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
         if thread_id:
-            # reply→create fallback inside a topic: thread_id as receive_id keeps it in the topic.
-            receive_id, receive_id_type = thread_id, "thread_id"
-        elif chat_id.startswith("feishu_user_id:"):
+            anchor = await self._fetch_last_message_in_thread(thread_id)
+            if anchor:
+                logger.info("[Feishu] No reply anchor for topic %s; replying into it via %s", thread_id, anchor)
+                body = self._build_reply_message_body(
+                    content=payload, msg_type=msg_type, reply_in_thread=True, uuid_value=str(uuid.uuid4()),
+                )
+                request = self._build_reply_message_request(anchor, body)
+                response = await self._run_blocking(self._client.im.v1.message.reply, request)
+                if (self._response_succeeded(response)
+                        or getattr(response, "code", None) not in _FEISHU_REPLY_FALLBACK_CODES):
+                    return response
+                # The anchor vanished between the lookup and the reply — post top-level rather
+                # than dropping the message (a caller-supplied anchor suppresses this fallback
+                # to avoid spawning a topic; one we looked up ourselves has no such claim).
+                logger.warning(
+                    "[Feishu] Topic anchor %s rejected (code %s — withdrawn/missing); sending to chat %s top-level",
+                    anchor, getattr(response, "code", None), chat_id,
+                )
+            else:
+                logger.warning(
+                    "[Feishu] Topic %s has no addressable last message; sending to chat %s top-level instead",
+                    thread_id, chat_id,
+                )
+        elif raw_thread_id:
+            _warn_thread_id_pollution(raw_thread_id, chat_id)
+        if chat_id.startswith("feishu_user_id:"):
             receive_id, receive_id_type = chat_id.split(":", 1)[1], "user_id"
         else:
             receive_id, receive_id_type = chat_id, "open_id" if chat_id.startswith("ou_") else "chat_id"
@@ -3849,8 +3893,18 @@ class FeishuAdapter(BasePlatformAdapter):
             CreateMessageRequestBody, receive_id=receive_id, msg_type=msg_type, content=content, uuid=uuid_value,
         )
 
-    @staticmethod
-    def _build_create_message_request(receive_id_type: str, request_body: Any) -> Any:
+    # ``receive_id_type`` values the send-message API accepts; anything else is rejected outright
+    # with 99992402 ("field validation failed") — e.g. the ``thread_id`` this adapter used to send.
+    _VALID_RECEIVE_ID_TYPES = frozenset({"chat_id", "open_id", "user_id", "union_id", "email"})
+
+    @classmethod
+    def _build_create_message_request(cls, receive_id_type: str, request_body: Any) -> Any:
+        if receive_id_type not in cls._VALID_RECEIVE_ID_TYPES:
+            logger.warning(
+                "[Feishu] receive_id_type %r is not a valid API enum value; sending as chat_id",
+                receive_id_type,
+            )
+            receive_id_type = "chat_id"
         return _sdk_build(CreateMessageRequest, receive_id_type=receive_id_type, request_body=request_body)
 
     @staticmethod

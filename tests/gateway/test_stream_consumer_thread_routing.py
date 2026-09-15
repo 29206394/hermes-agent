@@ -107,68 +107,89 @@ class TestOverflowFirstMessage:
 
 
 class TestFeishuFallbackThreadRouting:
-    """Verify FeishuAdapter._send_raw_message routes to topic on fallback."""
+    """FeishuAdapter._send_raw_message must never send ``receive_id_type='thread_id'``.
 
-    @pytest.mark.asyncio
-    async def test_create_uses_thread_id_when_available(self):
-        """When reply_to=None and metadata has thread_id, message.create
-        should use receive_id_type='thread_id'."""
+    That value is not in the send-message API's enum (chat_id/open_id/user_id/union_id/email),
+    so it failed with ``[99992402] field validation failed`` on every threaded send. A topic is
+    reachable only through the reply API: anchor on its last message with
+    ``reply_in_thread=True``, else post top-level into the chat. Full matrix:
+    ``tests/gateway/test_feishu_thread_delivery_routing.py``.
+    """
+
+    POLLUTED_THREAD_ID = "om_x100b67a1e00b5070b326b10883ed5ca"  # root_id stored in the thread slot
+    REAL_TOPIC_ID = "omt_19c12c3e528f9c8e"
+
+    @staticmethod
+    def _adapter_with(message_api):
+        from gateway.config import PlatformConfig
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
-        # We test the _send_raw_message method directly by mocking the client
-        adapter = MagicMock(spec=FeishuAdapter)
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=message_api)))
+        return adapter
 
-        # Set up the real _send_raw_message logic manually
-        mock_client = MagicMock()
-        mock_create_response = SimpleNamespace(
-            success=lambda: True,
-            data=SimpleNamespace(message_id="new_msg_1"),
-        )
-        mock_client.im.v1.message.create = MagicMock(return_value=mock_create_response)
-
-        # Use the real implementation path
-        adapter._client = mock_client
-        adapter._build_create_message_body = FeishuAdapter._build_create_message_body
-        adapter._build_create_message_request = FeishuAdapter._build_create_message_request
-        # _send_raw_message routes blocking SDK calls through _run_blocking
-        # (adapter-owned executor). On a MagicMock(spec=...) that method is
-        # auto-mocked and would swallow the real call, so wire a passthrough.
-        async def _run_blocking_passthrough(func, *args):
-            return func(*args)
-        adapter._run_blocking = _run_blocking_passthrough
-
-        # Call _send_raw_message with reply_to=None and thread_id in metadata
+    @pytest.mark.asyncio
+    async def test_topic_without_anchor_replies_into_the_topic(self):
         import json
-        result = await FeishuAdapter._send_raw_message(
-            adapter,
+
+        calls = {"reply": [], "create": []}
+
+        class _MessageAPI:
+            def list(self, request):
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(
+                    items=[SimpleNamespace(message_id="om_last_in_topic")]))
+
+            def reply(self, request):
+                calls["reply"].append(request)
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_reply"))
+
+            def create(self, request):
+                calls["create"].append(request)
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_created"))
+
+        adapter = self._adapter_with(_MessageAPI())
+        result = await adapter._send_raw_message(
             chat_id="oc_main_chat",
             msg_type="text",
             payload=json.dumps({"text": "hello"}),
             reply_to=None,
-            metadata={"thread_id": "omt_topic_abc"},
+            metadata={"thread_id": self.REAL_TOPIC_ID},
         )
 
-        # Verify message.create was called (not message.reply)
-        mock_client.im.v1.message.create.assert_called_once()
+        assert result.success
+        assert not calls["create"], "a real topic must not be addressed through message.create"
+        assert calls["reply"][0].message_id == "om_last_in_topic"
+        assert calls["reply"][0].request_body.reply_in_thread is True
 
-        # The request should have receive_id_type="thread_id"
-        call_args = mock_client.im.v1.message.create.call_args[0][0]
-        # Lark SDK builder exposes .body; the in-tree fallback exposes .request_body.
-        # The contributor's branch had the lark SDK installed, the test environment
-        # may not — handle both shapes.
-        body = getattr(call_args, "body", None) or getattr(call_args, "request_body", None)
-        assert body is not None, "request has neither .body nor .request_body"
-        # receive_id should be the thread_id, not the chat_id
-        receive_id = getattr(body, "receive_id", None)
-        if receive_id is None and isinstance(body, str):
-            import json as _json
-            receive_id = _json.loads(body).get("receive_id")
-        assert receive_id == "omt_topic_abc", (
-            f"Expected receive_id='omt_topic_abc', got '{receive_id}'"
+    @pytest.mark.asyncio
+    async def test_thread_slot_holding_a_message_id_falls_back_to_chat_send(self):
+        import json
+
+        calls = {"reply": [], "create": []}
+
+        class _MessageAPI:
+            def list(self, request):
+                return SimpleNamespace(success=lambda: False, code=99991672, data=None)
+
+            def reply(self, request):
+                calls["reply"].append(request)
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_reply"))
+
+            def create(self, request):
+                calls["create"].append(request)
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_created"))
+
+        adapter = self._adapter_with(_MessageAPI())
+        result = await adapter._send_raw_message(
+            chat_id="oc_main_chat",
+            msg_type="text",
+            payload=json.dumps({"text": "hello"}),
+            reply_to=None,
+            metadata={"thread_id": self.POLLUTED_THREAD_ID},
         )
-        # And receive_id_type must be 'thread_id', not 'chat_id'
-        receive_id_type = getattr(call_args, "receive_id_type", None)
-        assert receive_id_type == "thread_id", (
-            f"Expected receive_id_type='thread_id', got '{receive_id_type}'"
-        )
+
+        assert result.success
+        assert not calls["reply"]
+        assert calls["create"][0].receive_id_type == "chat_id"
+        assert calls["create"][0].request_body.receive_id == "oc_main_chat"
 

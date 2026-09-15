@@ -19,6 +19,7 @@ and fail-closed on nothing-to-send.
 import asyncio
 import logging
 from concurrent.futures import Future
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -243,6 +244,43 @@ class TestEmptyPayloadFailsClosed:
         assert router_calls == []
         assert error is not None
         assert "live adapter send skipped (empty text and no media)" in error
+
+
+class TestThreadFallbackNoticeOnlyForDictResponses:
+    """A confirmed threaded send must not be failed (and re-sent) by the notice lookup.
+
+    ``thread_fallback`` / ``requested_thread_id`` are keys the **Telegram** adapter puts in a
+    dict ``raw_response``. Feishu returns the SDK's ``CreateMessageResponse`` object instead, so
+    reading that key unguarded raised ``'CreateMessageResponse' object has no attribute 'get'``
+    after a *successful* send — the live lane then reported a failure and the standalone lane
+    re-sent the same message (duplicate card in the target chat). Unreachable before #375 only
+    because every threaded Feishu send died at the API with 99992402 first.
+    """
+
+    def test_sdk_object_response_is_a_confirmed_delivery_and_is_not_re_sent(self, caplog):
+        with caplog.at_level(logging.INFO, logger="cron.scheduler"):
+            error, router_calls, standalone_calls = _run(
+                _job(thread_id="omt_19e3724aad8fdb98"),
+                "Card.",
+                _SendResult(message_id="om_x1", raw_response=SimpleNamespace(code=0, msg="success")),
+            )
+
+        assert error is None
+        assert len(router_calls) == 1
+        assert standalone_calls == []                       # no duplicate re-send
+        assert "via live adapter thread=omt_19e3724aad8fdb98" in caplog.text
+
+    def test_telegram_dict_response_keeps_its_thread_fallback_notice(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="cron.scheduler"):
+            error, _, standalone_calls = _run(
+                _job(thread_id="99"),
+                "Card.",
+                _SendResult(message_id=99, raw_response={"thread_fallback": True, "requested_thread_id": 99}),
+            )
+
+        assert standalone_calls == []
+        assert "configured thread_id 99" in (error or "")
+        assert "was not found; delivered without thread_id" in caplog.text
 
 
 class TestDeliveredLogNamesTheLane:
