@@ -724,6 +724,69 @@ def _join_tier(parts: List[Optional[str]]) -> str:
     return "\n\n".join(p.strip() for p in parts if p and p.strip())
 
 
+
+
+# ── Issue #46 层2: 已登录用户身份注入 ──────────────────────────────
+# dashboard 多用户认证（users provider）登录后 agent._user_id = 用户名
+# （june/moxian/yangming/admin）。此处把「当前用户」注入 system prompt stable 段，
+# 让 agent 在对话里知道在和谁说话（提 issue / 写评论时『指示者』= 当前用户）。
+
+_OPERATOR_NAMES: dict = {}  # username -> display_name，缓存 dashboard_users.json
+_OPERATOR_NAMES_MTIME: float = 0.0
+
+
+def _operator_display_name(uid: str) -> str:
+    """user_id -> 中文名（~/.hermes/dashboard_users.json，mtime 变化时重读）。"""
+    global _OPERATOR_NAMES, _OPERATOR_NAMES_MTIME
+    try:
+        import json
+        from pathlib import Path
+        p = Path.home() / ".hermes/dashboard_users.json"
+        if p.exists():
+            mtime = p.stat().st_mtime
+            if not _OPERATOR_NAMES or mtime != _OPERATOR_NAMES_MTIME:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                _OPERATOR_NAMES = {
+                    u: (v.get("display_name") or u)
+                    for u, v in (data.get("users") or {}).items()
+                }
+                _OPERATOR_NAMES_MTIME = mtime
+            return _OPERATOR_NAMES.get(uid, "")
+    except Exception:
+        pass
+    return ""
+
+
+def _operator_identity_block(agent: Any) -> str:
+    """构造「当前用户身份」system prompt 块；非认证会话返回空串。
+
+    排除（那些场景已有 source 标识，不在此注入）:
+      - server-internal / ip:*（内部进程 / A2A 来源 IP）
+      - ou_/oc_/om_ 前缀（飞书 open_id/群）
+      - 含 @ 的邮箱形态
+    """
+    uid = getattr(agent, "_user_id", None)
+    if not uid or not isinstance(uid, str) or not uid.strip():
+        return ""
+    uid = uid.strip()
+    if (
+        uid in ("server-internal", "admin")
+        or uid.startswith("ip:")
+        or uid.startswith("ou_")
+        or uid.startswith("oc_")
+        or uid.startswith("om_")
+        or "@" in uid
+    ):
+        return ""
+    name = _operator_display_name(uid) or uid
+    return (
+        "\n# 当前用户身份\n"
+        f"当前与您对话的已登录用户: {name}（账号 {uid}）\n"
+        "该用户通过 dashboard 多用户认证登录。您在提 issue、写完成/验收评论时，"
+        "『指示者』字段即为当前用户；若无法确定则写「Agent 自主」。"
+    )
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers: ``stable`` (identity,
     guidance and the coding brief), ``context`` (caller ``system_message``, project
@@ -749,6 +812,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if "skill_view" in (agent.valid_tool_names or set()) and "- hermes-agent:" in skills_prompt:
         stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
     stable_parts.extend(_alibaba_identity_part(agent))
+    # Issue #46 层2：已登录用户身份注入（stable 段，会话级稳定）
+    stable_parts.append(_operator_identity_block(agent))
     # Pinned skills are per-agent constants (resolved once), so they live in the stable prefix.
     stable_parts.extend(_auto_load_parts(agent))
     # Coding posture: the operating brief stays in the stable prefix. The
