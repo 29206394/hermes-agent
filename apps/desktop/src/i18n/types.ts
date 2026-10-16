@@ -1761,6 +1761,9 @@ export interface Translations extends NoticeTranslations {
       autoArchiveDaysLabel: string
       autoArchiveDaysUnit: string
       autoArchiveFailed: string
+      recentsShowA2ATitle: string
+      recentsShowA2ADesc: string
+      recentsShowA2AFailed: string
       defaultDirTitle: string
       defaultDirDesc: string
       defaultDirUpdated: string

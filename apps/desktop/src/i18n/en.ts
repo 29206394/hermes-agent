@@ -1968,6 +1968,10 @@ export const en: Translations = {
       autoArchiveDaysLabel: 'Archive after',
       autoArchiveDaysUnit: 'days of inactivity',
       autoArchiveFailed: 'Could not update auto-archive',
+      recentsShowA2ATitle: 'Show A2A sessions in the recent list',
+      recentsShowA2ADesc:
+        'Tasks another machine dispatched to this one over A2A. They stay out of the sidebar by default because every inbound task adds a row that is not one of your conversations. Session search still finds them either way.',
+      recentsShowA2AFailed: 'Could not update the A2A recents setting',
       defaultDirTitle: 'Default project directory',
       defaultDirDesc:
         'New sessions start in this folder unless you pick another. Leave it unset to use your home directory.',
